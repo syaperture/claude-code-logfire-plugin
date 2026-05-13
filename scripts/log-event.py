@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
-VERSION = "0.4.2"
+VERSION = "0.4.6"
 
 OTLP_EVENTS = {"SessionStart", "Stop", "SubagentStop", "SessionEnd"}
 
@@ -540,16 +540,27 @@ def _merge_assistant_content(base: dict, new: dict) -> None:
         base["timestamp"] = new["timestamp"]
 
 
-def parse_transcript_slice(transcript_path: str | None, last_line: int) -> tuple[list[dict], int]:
+def parse_transcript_slice(
+    transcript_path: str | None,
+    last_line: int,
+    retries: int | None = None,
+) -> tuple[list[dict], int]:
     """Parse new transcript lines, returning (api_calls, new_total_lines).
 
     Each api_call has: model, timestamp, stop_reason, usage,
     input_messages, output_messages.
+
+    ``retries`` overrides the env-var default; pass 0 from contexts where
+    we cannot afford to block (e.g. SessionEnd cleanup, which races against
+    Claude Code's exit-time hook killer).
     """
     if not transcript_path or not os.path.isfile(transcript_path):
         return [], last_line
 
-    max_attempts = int(os.environ.get("TRANSCRIPT_READ_RETRIES", "20"))
+    if retries is not None:
+        max_attempts = retries
+    else:
+        max_attempts = int(os.environ.get("TRANSCRIPT_READ_RETRIES", "20"))
     retry_delay = float(os.environ.get("TRANSCRIPT_READ_DELAY_SECONDS", "0.1"))
 
     for attempt in range(max_attempts + 1):
@@ -905,6 +916,7 @@ def handle_session_start(
 ) -> None:
     if not acquire_lock(lock_file):
         return
+    payload: dict | None = None
     try:
         root_span_id = random_span_id()
         cwd = inp.get("cwd", "")
@@ -974,9 +986,11 @@ def handle_session_start(
             attrs,
         )
         payload = build_otlp_envelope([span])
-        send_otlp(payload, otlp_endpoint, logfire_token)
     finally:
         release_lock(lock_file)
+
+    if payload is not None:
+        send_otlp(payload, otlp_endpoint, logfire_token)
 
 
 def _merge_tools_meta(state: dict, new_meta: dict) -> None:
@@ -1005,6 +1019,7 @@ def handle_stop(
 ) -> None:
     if not acquire_lock(lock_file):
         return
+    payload: dict | None = None
     try:
         state = read_state(state_file)
         if not state:
@@ -1028,12 +1043,9 @@ def handle_stop(
             api_calls, trace_id, root_span_id, model_default, ts_nano, subagent_type=subagent_type
         )
 
-        if spans:
-            payload = build_otlp_envelope(spans)
-            send_otlp(payload, otlp_endpoint, logfire_token)
-
-        # Re-read state in case of concurrent modification
-        state = read_state(state_file) or state
+        # Persist state under lock so concurrent hooks can't race; defer the
+        # slow OTLP send until after release so a hook timeout can't strand
+        # the lock and starve SessionEnd.
         state["last_line"] = new_total
         state["all_messages"] = state.get("all_messages", []) + new_messages
         state["cost_details"] = state.get("cost_details", []) + new_cost_details
@@ -1041,8 +1053,92 @@ def handle_stop(
             state["usage"][k] = state["usage"].get(k, 0) + v
         _merge_tools_meta(state, tools_meta)
         write_state(state_file, state)
+
+        if spans:
+            payload = build_otlp_envelope(spans)
     finally:
         release_lock(lock_file)
+
+    if payload is not None:
+        send_otlp(payload, otlp_endpoint, logfire_token)
+
+
+def _build_root_span_payload(
+    state: dict,
+    trace_id: str,
+    ts_nano: int,
+    session_id: str,
+) -> dict:
+    """Build an OTLP envelope for the finalized root span from accumulated state."""
+    root_span_id = state["root_span_id"]
+    state_parent_span_id = state.get("parent_span_id", "")
+    start_time = state.get("start_time", str(ts_nano))
+    cwd = state.get("cwd", "")
+    model = state.get("model", "")
+    all_messages = state.get("all_messages", [])
+
+    final_result = None
+    for msg in reversed(all_messages):
+        if msg.get("role") == "assistant":
+            for part in reversed(msg.get("parts", [])):
+                if part.get("type") == "text":
+                    final_result = part.get("content")
+                    break
+            break
+
+    session_label = get_session_label()
+    attrs = [
+        make_attr("logfire.msg", session_label),
+        make_attr("logfire.span_type", "span"),
+        make_attr("agent_name", "claude-code"),
+        make_attr("gen_ai.agent.name", "claude-code"),
+        make_attr("gen_ai.system", "anthropic"),
+    ]
+    if model:
+        attrs.append(make_attr("gen_ai.response.model", model))
+        attrs.append(make_attr("model_name", model))
+    attrs.append(make_attr("session.id", session_id))
+    if cwd:
+        attrs.append(make_attr("session.cwd", cwd))
+    if final_result is not None:
+        attrs.append(make_complex_attr("final_result", final_result))
+    attrs.append(make_complex_attr("pydantic_ai.all_messages", all_messages))
+
+    meta = state.get("tools_meta", {})
+    tools_used_counts = [{"tool": name, "count": count} for name, count in meta.get("tools_used", {}).items()]
+    if tools_used_counts:
+        attrs.append(make_complex_attr("claude_code.tools_used", tools_used_counts))
+    agg_categories = meta.get("categories", [])
+    if agg_categories:
+        attrs.append(make_complex_attr("claude_code.tool_categories", agg_categories))
+    agg_skills = meta.get("skills", [])
+    if agg_skills:
+        attrs.append(make_complex_attr("claude_code.skills_used", agg_skills))
+
+    json_schema: dict = {
+        "type": "object",
+        "properties": {
+            "final_result": {"type": "object"},
+            "pydantic_ai.all_messages": {"type": "array"},
+        },
+    }
+    if tools_used_counts:
+        json_schema["properties"]["claude_code.tools_used"] = {"type": "array"}
+        json_schema["properties"]["claude_code.tool_categories"] = {"type": "array"}
+    if agg_skills:
+        json_schema["properties"]["claude_code.skills_used"] = {"type": "array"}
+    attrs.append(make_complex_attr("logfire.json_schema", json_schema))
+
+    span = build_span(
+        trace_id,
+        root_span_id,
+        state_parent_span_id,
+        session_label,
+        int(start_time),
+        ts_nano,
+        attrs,
+    )
+    return build_otlp_envelope([span])
 
 
 def handle_session_end(
@@ -1061,28 +1157,36 @@ def handle_session_end(
         log_diag("warn", "SessionEnd without state file, skipping root span")
         return
 
+    # Eagerly send the root span from current state BEFORE any slow work
+    # (lock, transcript parsing, cleanup). Claude Code aggressively kills
+    # hook subprocesses when /exit shuts down the parent, so the finalized
+    # root span has to be the FIRST thing we ship — anything that runs
+    # after this is racing the kill signal.
+    send_otlp(_build_root_span_payload(state, trace_id, ts_nano, session_id), otlp_endpoint, logfire_token)
+
+    # Best-effort cleanup: top up with any trailing transcript that landed
+    # after the last Stop, then drop the state file. If we get killed here,
+    # the trace is already closed in Logfire; the leftover state file is
+    # cosmetic. Pass retries=0 to parse_transcript_slice — we cannot afford
+    # to block waiting for an assistant line that won't land after /exit.
     if not acquire_lock(lock_file):
         return
+    pending_payloads: list[dict] = []
     try:
         root_span_id = state["root_span_id"]
-        state_parent_span_id = state.get("parent_span_id", "")
-        start_time = state.get("start_time", str(ts_nano))
-        cwd = state.get("cwd", "")
         model = state.get("model", "")
-
-        # Final transcript parse for any remaining messages
         state_tp = state.get("transcript_path", "")
         last_line = state.get("last_line", 0)
         final_tp = transcript_path or state_tp
+        appended = False
         if final_tp and os.path.isfile(final_tp):
-            remaining_calls, new_total = parse_transcript_slice(final_tp, last_line)
+            remaining_calls, new_total = parse_transcript_slice(final_tp, last_line, retries=0)
             if remaining_calls:
                 spans, new_msgs, new_costs, usage_deltas, tools_meta = build_child_spans_from_calls(
                     remaining_calls, trace_id, root_span_id, model, ts_nano
                 )
                 if spans:
-                    payload = build_otlp_envelope(spans)
-                    send_otlp(payload, otlp_endpoint, logfire_token)
+                    pending_payloads.append(build_otlp_envelope(spans))
 
                 state["last_line"] = new_total
                 state["all_messages"] = state.get("all_messages", []) + new_msgs
@@ -1090,78 +1194,12 @@ def handle_session_end(
                 for k, v in usage_deltas.items():
                     state["usage"][k] = state["usage"].get(k, 0) + v
                 _merge_tools_meta(state, tools_meta)
+                appended = True
 
-        all_messages = state.get("all_messages", [])
-
-        # Extract final_result: last text part from last assistant message
-        final_result = None
-        for msg in reversed(all_messages):
-            if msg.get("role") == "assistant":
-                for part in reversed(msg.get("parts", [])):
-                    if part.get("type") == "text":
-                        final_result = part.get("content")
-                        break
-                break
-
-        # Build root span attributes
-        session_label = get_session_label()
-        attrs = [
-            make_attr("logfire.msg", session_label),
-            make_attr("logfire.span_type", "span"),
-            make_attr("agent_name", "claude-code"),
-            make_attr("gen_ai.agent.name", "claude-code"),
-            make_attr("gen_ai.system", "anthropic"),
-        ]
-        if model:
-            attrs.append(make_attr("gen_ai.response.model", model))
-            attrs.append(make_attr("model_name", model))
-        attrs.append(make_attr("session.id", session_id))
-        if cwd:
-            attrs.append(make_attr("session.cwd", cwd))
-        if final_result is not None:
-            attrs.append(make_complex_attr("final_result", final_result))
-        attrs.append(make_complex_attr("pydantic_ai.all_messages", all_messages))
-
-        # Aggregated tool metadata from all Stop events
-        meta = state.get("tools_meta", {})
-        tools_used_counts = [
-            {"tool": name, "count": count}
-            for name, count in meta.get("tools_used", {}).items()
-        ]
-        if tools_used_counts:
-            attrs.append(make_complex_attr("claude_code.tools_used", tools_used_counts))
-        agg_categories = meta.get("categories", [])
-        if agg_categories:
-            attrs.append(make_complex_attr("claude_code.tool_categories", agg_categories))
-        agg_skills = meta.get("skills", [])
-        if agg_skills:
-            attrs.append(make_complex_attr("claude_code.skills_used", agg_skills))
-
-        json_schema: dict = {
-            "type": "object",
-            "properties": {
-                "final_result": {"type": "object"},
-                "pydantic_ai.all_messages": {"type": "array"},
-            },
-        }
-        if tools_used_counts:
-            json_schema["properties"]["claude_code.tools_used"] = {"type": "array"}
-            json_schema["properties"]["claude_code.tool_categories"] = {"type": "array"}
-        if agg_skills:
-            json_schema["properties"]["claude_code.skills_used"] = {"type": "array"}
-        attrs.append(make_complex_attr("logfire.json_schema", json_schema))
-
-        span = build_span(
-            trace_id,
-            root_span_id,
-            state_parent_span_id,
-            session_label,
-            int(start_time),
-            ts_nano,
-            attrs,
-        )
-        payload = build_otlp_envelope([span])
-        send_otlp(payload, otlp_endpoint, logfire_token)
+        # Only re-send the root span if cleanup actually added new messages —
+        # otherwise the eager send already has the latest content.
+        if appended:
+            pending_payloads.append(_build_root_span_payload(state, trace_id, ts_nano, session_id))
 
         try:
             os.unlink(state_file)
@@ -1169,6 +1207,9 @@ def handle_session_end(
             pass
     finally:
         release_lock(lock_file)
+
+    for payload in pending_payloads:
+        send_otlp(payload, otlp_endpoint, logfire_token)
 
 
 # ---------------------------------------------------------------------------
@@ -1270,7 +1311,9 @@ def main() -> None:
             session_id,
         )
     elif hook_event in ("Stop", "SubagentStop"):
-        handle_stop(inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, hook_event)
+        handle_stop(
+            inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, hook_event
+        )
     elif hook_event == "SessionEnd":
         handle_session_end(
             inp, state_file, lock_file, trace_id, ts_nano, transcript_path, otlp_endpoint, logfire_token, session_id

@@ -19,7 +19,7 @@
           {
             "type": "command",
             "command": "python3 \"$CLAUDE_PLUGIN_ROOT/scripts/log-event.py\"",
-            "timeout": 10
+            "timeout": 30
           }
         ]
       }
