@@ -13,8 +13,19 @@ Subcommands
     status   Show whether a token is stored, when it expires, and which scopes
              it carries.
 
-The flow performs Dynamic Client Registration (RFC 7591) for a public client
-on first login, then RFC 8628 device authorization with PKCE (RFC 7636). The
+The flow uses a Client ID Metadata Document (CIMD): the ``client_id`` is the
+URL of a JSON document that the authorization server fetches to learn the
+client's grants, scopes, and redirect URIs. For this plugin the CIMD is
+hosted alongside Logfire itself:
+
+    https://logfire.pydantic.dev/clients/claude-code-logfire.json   (prod)
+    https://logfire.pydantic.info/clients/claude-code-logfire.json  (staging)
+
+CIMD is preferred over RFC 7591 Dynamic Client Registration because it
+produces a stable, human-recognisable client identity (the same client_id
+across every install) and skips the extra registration round-trip.
+
+The flow is RFC 8628 (Device Authorization Grant) with PKCE (RFC 7636); the
 ``project:write_otlp`` scope is requested by default — the same scope the
 Fusionfire intake checks on ``/v1/traces``.
 
@@ -59,8 +70,32 @@ from oauth_token import (  # noqa: E402
     save_bundle,
 )
 
-CLIENT_NAME = "claude-code-logfire-plugin"
 DEVICE_CODE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
+
+# Client ID Metadata Document URLs. The ``client_id`` IS the URL — the
+# authorization server fetches it to discover the client's allowed grants,
+# scopes, and redirect URIs. Maps an authorization-server host to the CIMD
+# host that publishes the canonical metadata for this plugin.
+CIMD_PATH = "/clients/claude-code-logfire.json"
+CIMD_BY_HOST_SUFFIX = (
+    (".pydantic.dev", "https://logfire.pydantic.dev" + CIMD_PATH),
+    (".pydantic.info", "https://logfire.pydantic.info" + CIMD_PATH),
+)
+
+
+def _default_client_id(base_url: str) -> str | None:
+    """Pick the CIMD URL that matches ``base_url``'s host suffix.
+
+    Returns ``None`` for hosts that don't match a known suffix (e.g. local
+    development at ``localhost:3000`` or self-hosted deployments); in that
+    case the user must pass ``--client-id`` explicitly.
+    """
+    parsed = urllib.parse.urlparse(base_url)
+    host = (parsed.hostname or "").lower()
+    for suffix, cimd_url in CIMD_BY_HOST_SUFFIX:
+        if host == suffix.lstrip(".") or host.endswith(suffix):
+            return cimd_url
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -111,38 +146,9 @@ def _post_form(url: str, fields: dict, timeout: float = 30.0) -> dict:
         return json.load(r)
 
 
-def _post_json(url: str, body: dict, timeout: float = 30.0) -> dict:
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode(),
-        headers={"Content-Type": "application/json", "Accept": "application/json"},
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        return json.load(r)
-
-
 # ---------------------------------------------------------------------------
 # Device flow
 # ---------------------------------------------------------------------------
-
-
-def register_client(metadata: dict, scope: str) -> str:
-    """RFC 7591 Dynamic Client Registration — produces a public client_id
-    bound to the device-code + refresh-token grants and the requested scope."""
-    if "registration_endpoint" not in metadata:
-        raise SystemExit(
-            "Authorization server does not advertise a registration_endpoint. "
-            "Pass --client-id to use a pre-registered OAuth client instead."
-        )
-    body = {
-        "client_name": CLIENT_NAME,
-        "grant_types": [DEVICE_CODE_GRANT, "refresh_token"],
-        "token_endpoint_auth_method": "none",
-        "redirect_uris": [],
-        "scope": scope,
-    }
-    return _post_json(metadata["registration_endpoint"], body)["client_id"]
 
 
 def request_device_code(
@@ -217,11 +223,15 @@ def cmd_login(args: argparse.Namespace) -> int:
 
     if args.client_id:
         client_id = args.client_id
-        print(f"Using pre-registered client_id={client_id}")
     else:
-        print("Registering OAuth client (RFC 7591) ...")
-        client_id = register_client(metadata, scope)
-        print(f"Registered client_id={client_id}")
+        client_id = _default_client_id(base_url)
+        if not client_id:
+            raise SystemExit(
+                f"No CIMD client_id is known for {base_url}. "
+                f"Pass --client-id explicitly (e.g. the URL of a Client ID "
+                f"Metadata Document hosted by your Logfire deployment)."
+            )
+    print(f"Using CIMD client_id={client_id}")
 
     verifier, challenge = _pkce_pair()
     device = request_device_code(
@@ -327,7 +337,11 @@ def main() -> int:
     login_p.add_argument(
         "--client-id",
         default=None,
-        help="Pre-registered OAuth client_id to use instead of Dynamic Client Registration",
+        help=(
+            "OAuth client_id (a Client ID Metadata Document URL). "
+            "Defaults to the CIMD that matches --base-url's host "
+            "(logfire.pydantic.dev for prod, logfire.pydantic.info for staging)."
+        ),
     )
     login_p.add_argument(
         "--scope",
