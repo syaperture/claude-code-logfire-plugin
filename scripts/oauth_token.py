@@ -14,7 +14,7 @@ A token "bundle" is persisted per-base-URL at
       "refresh_token": "...",
       "expires_at": 1234567890.0,
       "scope": "project:write_otlp",
-      "client_id": "<DCR-registered>",
+      "client_id": "https://logfire.pydantic.dev/clients/claude-code-logfire.json",
       "resource": "https://logfire-us.pydantic.dev/v1/traces"
     }
   }
