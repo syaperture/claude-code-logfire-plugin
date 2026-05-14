@@ -11,7 +11,7 @@ A Claude Code plugin that captures sessions and exports pydantic-ai compatible O
 The plugin has three Python scripts (all stdlib only) and an `hooks/hooks.json`:
 
 - `scripts/log-event.py` — invoked by every hook event; builds and ships OTLP spans.
-- `scripts/oauth_token.py` — shared module: load/save/refresh OAuth token bundle at `~/.logfire/claude-code-oauth.json`. Used by both the hook and the CLI.
+- `scripts/oauth_token.py` — shared module: load/save/refresh OAuth token bundle at `~/.logfire/claude-code-logfire-plugin.json`. Used by both the hook and the CLI.
 - `scripts/auth.py` — user-facing CLI for the OAuth Device Authorization Grant (RFC 8628) login / logout / status. Invoked by the `/logfire-login`, `/logfire-logout`, `/logfire-status` slash commands under `commands/`.
 
 The plugin manifest lives at `.claude-plugin/plugin.json`.

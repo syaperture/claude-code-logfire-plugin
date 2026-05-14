@@ -4,7 +4,7 @@ Stdlib-only helpers shared by ``auth.py`` (interactive device flow login) and
 ``log-event.py`` (hot-path hook handler that needs a valid access token).
 
 A token "bundle" is persisted per-base-URL at
-``~/.logfire/claude-code-oauth.json`` with mode 0600:
+``~/.logfire/claude-code-logfire-plugin.json`` with mode 0600:
 
 ```json
 {
@@ -54,8 +54,8 @@ LOCK_POLL_INTERVAL = 0.1
 LOCK_STALE_SECONDS = 30
 
 TOKEN_DIR = Path.home() / ".logfire"
-TOKEN_FILE = TOKEN_DIR / "claude-code-oauth.json"
-LOCK_DIR = TOKEN_DIR / ".claude-code-oauth.lock"
+TOKEN_FILE = TOKEN_DIR / "claude-code-logfire-plugin.json"
+LOCK_DIR = TOKEN_DIR / ".claude-code-logfire-plugin.lock"
 
 
 # ---------------------------------------------------------------------------
@@ -76,7 +76,7 @@ def _read_store() -> dict:
 
 def _write_store(data: dict) -> None:
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
-    fd, tmp = tempfile.mkstemp(prefix="claude-code-oauth.", dir=str(TOKEN_DIR))
+    fd, tmp = tempfile.mkstemp(prefix="claude-code-logfire-plugin.", dir=str(TOKEN_DIR))
     try:
         with os.fdopen(fd, "w") as f:
             json.dump(data, f, indent=2)

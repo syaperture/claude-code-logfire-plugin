@@ -8,7 +8,7 @@ invocation instead of a fixed ``LOGFIRE_TOKEN``.
 Subcommands
 -----------
     login    Run the device flow against ``LOGFIRE_BASE_URL`` (or --base-url)
-             and save the resulting tokens under ``~/.logfire/claude-code-oauth.json``.
+             and save the resulting tokens under ``~/.logfire/claude-code-logfire-plugin.json``.
     logout   Remove the stored tokens for a base URL.
     status   Show whether a token is stored, when it expires, and which scopes
              it carries.
@@ -285,7 +285,7 @@ def cmd_login(args: argparse.Namespace) -> int:
     print(f"Logged in to {base_url}")
     print(f"  scope:      {bundle.get('scope', '')}")
     print(f"  expires in: {int(bundle['expires_at'] - time.time())}s")
-    print("  stored at:  ~/.logfire/claude-code-oauth.json")
+    print("  stored at:  ~/.logfire/claude-code-logfire-plugin.json")
     print()
     print("To use OAuth instead of LOGFIRE_TOKEN, unset LOGFIRE_TOKEN in your shell")
     print("and (optionally) export LOGFIRE_BASE_URL if you're not using the US region.")

@@ -71,7 +71,7 @@ the Fusionfire OTLP intake via the RFC 8707 `resource` parameter). The
 hosts and `https://logfire.pydantic.info/...` for staging — so the
 authorization server fetches the canonical client metadata directly and no
 per-install registration is needed. On success the access + refresh tokens
-are written to `~/.logfire/claude-code-oauth.json` (mode 0600). The plugin reads them on every hook event and exchanges the
+are written to `~/.logfire/claude-code-logfire-plugin.json` (mode 0600). The plugin reads them on every hook event and exchanges the
 refresh token whenever the access token is within 60s of expiry; the new
 bundle is written back atomically and shared across all your Claude Code
 sessions.
