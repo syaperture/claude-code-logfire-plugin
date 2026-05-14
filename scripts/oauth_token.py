@@ -289,6 +289,27 @@ def _refresh(bundle: dict, base_url: str) -> dict:
     return new_bundle
 
 
+def force_refresh(base_url: str) -> dict:
+    """Force a refresh of the stored bundle for ``base_url`` and return it.
+
+    Raises ``LookupError`` if there's no stored bundle (or no refresh token
+    to exchange), ``RuntimeError`` if the cross-process lock can't be
+    acquired, and the underlying ``urllib`` error if the AS rejects the
+    refresh. Intended for the ``/logfire-refresh`` slash command —
+    ``get_access_token`` already refreshes lazily for the hook hot path.
+    """
+    key = base_url.rstrip("/")
+    with _lock() as acquired:
+        if not acquired:
+            raise RuntimeError(f"Could not acquire token-store lock for {key}")
+        bundle = load_bundle(key)
+        if not bundle:
+            raise LookupError(f"No stored token for {key}")
+        if not bundle.get("refresh_token"):
+            raise LookupError(f"Stored token for {key} has no refresh_token; run `login` again")
+        return _refresh(bundle, key)
+
+
 def get_access_token(base_url: str) -> str | None:
     """Return a valid access token for ``base_url``, refreshing if needed.
 

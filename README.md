@@ -76,10 +76,11 @@ refresh token whenever the access token is within 60s of expiry; the new
 bundle is written back atomically and shared across all your Claude Code
 sessions.
 
-Three slash commands ship with the plugin:
+Four slash commands ship with the plugin:
 
 - `/logfire-login` — start (or re-run) the device flow
 - `/logfire-status` — print expiry, scope, and client info for the stored bundle
+- `/logfire-refresh` — force-exchange the refresh token (debugging / manual rotation; hooks refresh lazily already)
 - `/logfire-logout` — delete the stored bundle for the active base URL
 
 Use `--base-url` on the script (or set `LOGFIRE_BASE_URL`) for EU / self-hosted
