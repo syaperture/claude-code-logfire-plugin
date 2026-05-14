@@ -28,6 +28,7 @@ rotation from racing when several Claude Code sessions start simultaneously.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import tempfile
@@ -96,13 +97,27 @@ def _write_store(data: dict) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _acquire_lock() -> bool:
+@contextlib.contextmanager
+def _lock():
+    """Best-effort cross-process lock around the token store.
+
+    Yields ``True`` if the lock was acquired, ``False`` if we timed out.
+    Callers that mutate state should still proceed on ``False``
+    (last-writer-wins beats dropping a freshly-issued token on the floor);
+    callers that race refresh-token rotation should bail on ``False``.
+
+    The release is gated on actual acquisition so a nested ``_lock()`` —
+    e.g. a refresh path that re-enters via ``save_bundle`` — can't tear
+    down its caller's lock.
+    """
+    acquired = False
     deadline = time.time() + LOCK_MAX_WAIT_SECONDS
     TOKEN_DIR.mkdir(parents=True, exist_ok=True)
     while True:
         try:
             os.mkdir(LOCK_DIR)
-            return True
+            acquired = True
+            break
         except FileExistsError:
             try:
                 if time.time() - os.path.getmtime(LOCK_DIR) > LOCK_STALE_SECONDS:
@@ -114,15 +129,16 @@ def _acquire_lock() -> bool:
             except OSError:
                 pass
             if time.time() >= deadline:
-                return False
+                break
             time.sleep(LOCK_POLL_INTERVAL)
-
-
-def _release_lock() -> None:
     try:
-        os.rmdir(LOCK_DIR)
-    except OSError:
-        pass
+        yield acquired
+    finally:
+        if acquired:
+            try:
+                os.rmdir(LOCK_DIR)
+            except OSError:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -134,33 +150,30 @@ def load_bundle(base_url: str) -> dict | None:
     return _read_store().get("tokens", {}).get(base_url.rstrip("/"))
 
 
-def save_bundle(base_url: str, bundle: dict) -> None:
+def _save_bundle_unlocked(base_url: str, bundle: dict) -> None:
+    """Write ``bundle`` for ``base_url`` without taking the lock. Callers
+    must already hold ``_lock()`` (used by the refresh path, which can't
+    re-enter the lock it already owns)."""
     key = base_url.rstrip("/")
-    if not _acquire_lock():
-        # If we can't grab the lock we still write — last writer wins, but
-        # that's better than dropping a freshly-issued token on the floor.
-        pass
-    try:
-        data = _read_store()
-        data.setdefault("tokens", {})[key] = bundle
-        _write_store(data)
-    finally:
-        _release_lock()
+    data = _read_store()
+    data.setdefault("tokens", {})[key] = bundle
+    _write_store(data)
+
+
+def save_bundle(base_url: str, bundle: dict) -> None:
+    with _lock():
+        _save_bundle_unlocked(base_url, bundle)
 
 
 def delete_bundle(base_url: str) -> None:
     key = base_url.rstrip("/")
-    if not _acquire_lock():
-        pass
-    try:
+    with _lock():
         data = _read_store()
         tokens = data.get("tokens", {})
         if key in tokens:
             del tokens[key]
             data["tokens"] = tokens
             _write_store(data)
-    finally:
-        _release_lock()
 
 
 def list_base_urls() -> list:
@@ -269,7 +282,10 @@ def _refresh(bundle: dict, base_url: str) -> dict:
         fallback_refresh=bundle["refresh_token"],
         fallback_scope=bundle.get("scope", ""),
     )
-    save_bundle(base_url, new_bundle)
+    # We're called from inside ``_lock()`` (via ``get_access_token``), so
+    # use the unlocked save to avoid the lock's 5-second timeout waiting on
+    # ourselves.
+    _save_bundle_unlocked(base_url, new_bundle)
     return new_bundle
 
 
@@ -299,13 +315,13 @@ def get_access_token(base_url: str) -> str | None:
 
     # Serialise refresh across sessions so refresh-token rotation doesn't
     # race itself into a 4xx.
-    if not _acquire_lock():
-        # Couldn't lock — fall back to the existing access token if it
-        # still has any life in it.
-        if expires_at > now:
-            return bundle.get("access_token") or None
-        return None
-    try:
+    with _lock() as acquired:
+        if not acquired:
+            # Couldn't lock — fall back to the existing access token if it
+            # still has any life in it.
+            if expires_at > now:
+                return bundle.get("access_token") or None
+            return None
         # Another session may have already refreshed while we waited.
         latest = load_bundle(key) or bundle
         latest_expires = float(latest.get("expires_at") or 0)
@@ -318,5 +334,3 @@ def get_access_token(base_url: str) -> str | None:
             if latest_expires > now:
                 return latest.get("access_token") or None
             return None
-    finally:
-        _release_lock()
