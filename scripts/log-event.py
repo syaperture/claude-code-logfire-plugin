@@ -26,7 +26,7 @@ from urllib.error import HTTPError, URLError
 from urllib.parse import unquote
 from urllib.request import Request, urlopen
 
-VERSION = "0.4.6"
+VERSION = "0.5.0"
 
 OTLP_EVENTS = {"SessionStart", "Stop", "SubagentStop", "SessionEnd"}
 
@@ -1259,13 +1259,25 @@ def main() -> None:
         except OSError:
             log_diag("error", "Failed to write JSONL log entry")
 
-    # OTel export requires token
-    logfire_token = os.environ.get("LOGFIRE_TOKEN", "")
-    if not logfire_token:
-        return
-
     base_url = os.environ.get("LOGFIRE_BASE_URL", "https://logfire-us.pydantic.dev").rstrip("/")
     otlp_endpoint = f"{base_url}/v1/traces"
+
+    # OTel export requires a token. Prefer the explicit LOGFIRE_TOKEN env var
+    # for backwards compatibility; otherwise fall back to a stored OAuth
+    # bundle (auto-refreshed) populated by ``scripts/auth.py login``.
+    logfire_token = os.environ.get("LOGFIRE_TOKEN", "")
+    if not logfire_token:
+        try:
+            sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+            from oauth_token import get_access_token
+            logfire_token = get_access_token(base_url) or ""
+        except Exception as exc:
+            log_diag("warn", "OAuth token lookup failed", str(exc))
+            logfire_token = ""
+        if logfire_token:
+            log_diag("info", "Using OAuth access token (refreshed on demand)")
+    if not logfire_token:
+        return
 
     # Only process OTLP events
     if _hook_event not in OTLP_EVENTS:

@@ -29,7 +29,13 @@ From within Claude Code, run:
 /plugin update logfire-session-capture@pydantic-claude-code-logfire-plugin
 ```
 
-### Set your Logfire token
+### Authenticate to Logfire
+
+The plugin supports two authentication modes. Pick whichever fits your setup —
+they're checked in order, so you can have both configured and `LOGFIRE_TOKEN`
+will win.
+
+#### Option A: Fixed write token (simplest)
 
 ```bash
 export LOGFIRE_TOKEN="your-logfire-write-token"
@@ -43,10 +49,48 @@ For the EU region:
 export LOGFIRE_BASE_URL="https://logfire-eu.pydantic.dev"
 ```
 
+#### Option B: OAuth with automatic refresh (no long-lived secret in your shell)
+
+Run the device flow once — the plugin then refreshes the access token silently
+on every hook invocation until you log out:
+
+```bash
+# From inside a Claude Code session:
+/logfire-login
+
+# Or directly from your shell:
+python3 ~/.claude/plugins/.../scripts/auth.py login
+```
+
+You'll see a one-time user code and a browser opens to authorize the plugin
+against your Logfire org / project (RFC 8628 Device Authorization Grant with
+PKCE; the access token carries the `project:write_otlp` scope and is bound to
+the Fusionfire OTLP intake via the RFC 8707 `resource` parameter). On success
+the access + refresh tokens are written to `~/.logfire/claude-code-oauth.json`
+(mode 0600). The plugin reads them on every hook event and exchanges the
+refresh token whenever the access token is within 60s of expiry; the new
+bundle is written back atomically and shared across all your Claude Code
+sessions.
+
+Three slash commands ship with the plugin:
+
+- `/logfire-login` — start (or re-run) the device flow
+- `/logfire-status` — print expiry, scope, and client info for the stored bundle
+- `/logfire-logout` — delete the stored bundle for the active base URL
+
+Use `--base-url` on the script (or set `LOGFIRE_BASE_URL`) for EU / self-hosted
+deployments — one bundle is kept per base URL, so you can be logged in to
+multiple regions simultaneously.
+
+Unset `LOGFIRE_TOKEN` to make the plugin use the OAuth bundle. If both are
+present, `LOGFIRE_TOKEN` wins (no surprise migrations).
+
+#### Configuration reference
+
 | Variable | Required | Default | Description |
 |---|---|---|---|
-| `LOGFIRE_TOKEN` | Yes | _(none)_ | Logfire write token |
-| `LOGFIRE_BASE_URL` | No | `https://logfire-us.pydantic.dev` | Logfire ingest endpoint |
+| `LOGFIRE_TOKEN` | One of token/OAuth | _(none)_ | Logfire write token. Takes precedence over the OAuth bundle when both are present. |
+| `LOGFIRE_BASE_URL` | No | `https://logfire-us.pydantic.dev` | Logfire ingest endpoint; also the OAuth issuer when using `/logfire-login` |
 | `LOGFIRE_LOCAL_LOG` | No | `false` | Set to `true` to write JSONL event logs locally |
 | `LOGFIRE_DIAGNOSTICS` | No | `false` | Set to `true` to write diagnostic logs (enabled automatically when `LOGFIRE_LOCAL_LOG` is set) |
 | `LOGFIRE_ENVIRONMENT` | No | _(none)_ | Sets `deployment.environment.name` on every trace (e.g. `production`, `dev`) |
@@ -54,7 +98,9 @@ export LOGFIRE_BASE_URL="https://logfire-eu.pydantic.dev"
 | `OTEL_SERVICE_NAME` | No | `claude-code-plugin` | Overrides the `service.name` resource attribute |
 | `OTEL_RESOURCE_ATTRIBUTES` | No | _(none)_ | Standard OTel env var for additional resource attributes, e.g. `deployment.environment.name=prod,service.instance.id=worker-1` |
 
-Without `LOGFIRE_TOKEN`, no traces are sent. The plugin does nothing unless at least one of `LOGFIRE_TOKEN` or `LOGFIRE_LOCAL_LOG` is set.
+Without either `LOGFIRE_TOKEN` or a stored OAuth bundle, no traces are sent.
+The plugin does nothing unless at least one auth mode or `LOGFIRE_LOCAL_LOG`
+is configured.
 
 ## What you get
 
@@ -118,8 +164,9 @@ Diagnostic logs are written to `.claude/logs/diagnostics.jsonl` in the project d
 
 **Common issues:**
 
-- **No traces appearing in Logfire** -- Check that `LOGFIRE_TOKEN` is set and valid. Enable diagnostics to see if OTLP exports are failing.
-- **Export errors (HTTP 401/403)** -- Your Logfire token may be invalid or expired. Generate a new write token in the Logfire console.
+- **No traces appearing in Logfire** -- Check that `LOGFIRE_TOKEN` is set and valid, or that `/logfire-status` reports a stored OAuth bundle. Enable diagnostics to see if OTLP exports are failing.
+- **Export errors (HTTP 401/403)** -- Your Logfire token may be invalid or expired. Generate a new write token in the Logfire console, or run `/logfire-login` to refresh the OAuth bundle.
+- **OAuth refresh keeps failing** -- The refresh token may have been revoked or expired. Run `/logfire-logout` then `/logfire-login` to start a fresh flow.
 - **Export errors (HTTP 4xx/5xx)** -- Check `LOGFIRE_BASE_URL` if using a non-default region. The plugin logs HTTP status codes to stderr and diagnostics.
 
 ## Development
