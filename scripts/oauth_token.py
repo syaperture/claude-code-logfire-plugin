@@ -14,9 +14,14 @@ A single token "bundle" is persisted at
   "expires_at": 1234567890.0,
   "scope": "project:write_otlp",
   "client_id": "https://logfire.pydantic.dev/clients/claude-code-logfire.json",
-  "resource": "https://logfire-us.pydantic.dev/v1/traces"
+  "resource": "https://logfire-us.pydantic.dev/v1",
+  "token_endpoint": "https://logfire-us.pydantic.dev/oauth/token"
 }
 ```
+
+``token_endpoint`` is cached from the RFC 8414 metadata at login (or
+re-populated on the first refresh of a legacy bundle) so the hot-path
+refresh doesn't have to make a discovery roundtrip before the token POST.
 
 Only one bundle is ever stored — logging in to a different ``base_url``
 overwrites the previous one. ``logout`` / ``status`` / ``refresh`` therefore
@@ -39,6 +44,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from typing import Any
 
 DEFAULT_BASE_URL = "https://logfire-us.pydantic.dev"
 DEFAULT_SCOPE = "project:write_otlp"
@@ -92,7 +98,7 @@ LOCK_DIR = TOKEN_DIR / ".claude-code-logfire-plugin.lock"
 # ---------------------------------------------------------------------------
 
 
-def _read_file() -> dict | None:
+def _read_file() -> dict[str, Any] | None:
     """Return the stored bundle, or ``None`` if no usable bundle exists."""
     try:
         with open(TOKEN_FILE) as f:
@@ -107,7 +113,7 @@ def _read_file() -> dict | None:
     return data
 
 
-def _write_file(bundle: dict) -> None:
+def _write_file(bundle: dict[str, Any]) -> None:
     """Atomically write ``bundle`` to ``TOKEN_FILE``. Raises ``OSError`` on
     failure so callers (notably ``cmd_login``) can surface the error rather
     than silently telling the user the token was saved."""
@@ -177,12 +183,12 @@ def _lock():
 # ---------------------------------------------------------------------------
 
 
-def load_bundle() -> dict | None:
+def load_bundle() -> dict[str, Any] | None:
     """Return the stored bundle (with ``base_url`` field) or ``None``."""
     return _read_file()
 
 
-def _save_bundle_unlocked(bundle: dict) -> None:
+def _save_bundle_unlocked(bundle: dict[str, Any]) -> None:
     """Write ``bundle`` without taking the lock. Callers must already hold
     ``_lock()`` (used by the refresh path, which can't re-enter the lock
     it already owns)."""
@@ -191,7 +197,7 @@ def _save_bundle_unlocked(bundle: dict) -> None:
     _write_file(bundle)
 
 
-def save_bundle(bundle: dict) -> None:
+def save_bundle(bundle: dict[str, Any]) -> None:
     with _lock():
         _save_bundle_unlocked(bundle)
 
@@ -206,7 +212,7 @@ def delete_bundle() -> None:
 # ---------------------------------------------------------------------------
 
 
-def _http_get_json(url: str, timeout: float = 10.0) -> dict:
+def _http_get_json(url: str, timeout: float = 10.0) -> dict[str, Any]:
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/json", "User-Agent": USER_AGENT},
@@ -215,7 +221,7 @@ def _http_get_json(url: str, timeout: float = 10.0) -> dict:
         return json.load(r)
 
 
-def _http_post_form(url: str, fields: dict, timeout: float = 30.0) -> dict:
+def _http_post_form(url: str, fields: dict[str, Any], timeout: float = 30.0) -> dict[str, Any]:
     body = urllib.parse.urlencode(fields).encode()
     req = urllib.request.Request(
         url,
@@ -231,7 +237,7 @@ def _http_post_form(url: str, fields: dict, timeout: float = 30.0) -> dict:
         return json.load(r)
 
 
-def discover_metadata(base_url: str) -> dict:
+def discover_metadata(base_url: str) -> dict[str, Any]:
     """RFC 8414 OAuth Authorization Server Metadata."""
     return _http_get_json(base_url.rstrip("/") + "/.well-known/oauth-authorization-server")
 
@@ -256,15 +262,16 @@ def discover_resource(base_url: str) -> str:
 
 
 def _bundle_from_token_response(
-    token: dict,
+    token: dict[str, Any],
     *,
     base_url: str,
     client_id: str,
     resource: str,
+    token_endpoint: str = "",
     fallback_refresh: str = "",
     fallback_scope: str = "",
-) -> dict:
-    return {
+) -> dict[str, Any]:
+    bundle: dict[str, Any] = {
         "base_url": base_url.rstrip("/"),
         "access_token": token["access_token"],
         "refresh_token": token.get("refresh_token") or fallback_refresh,
@@ -273,14 +280,22 @@ def _bundle_from_token_response(
         "client_id": client_id,
         "resource": resource,
     }
+    if token_endpoint:
+        bundle["token_endpoint"] = token_endpoint
+    return bundle
 
 
-def _refresh(bundle: dict) -> dict:
+def _refresh(bundle: dict[str, Any]) -> dict[str, Any]:
     """Exchange the refresh_token for a new access token. Raises on failure."""
-    base_url = bundle["base_url"]
-    metadata = discover_metadata(base_url)
-    resource = bundle.get("resource") or discover_resource(base_url)
-    fields = {
+    base_url: str = bundle["base_url"]
+    # Prefer the cached endpoint to skip the discovery roundtrip on the hot
+    # path; fall back to discovery for legacy bundles written before this
+    # field existed (the new bundle we save below will include it).
+    token_endpoint: str = bundle.get("token_endpoint") or ""
+    if not token_endpoint:
+        token_endpoint = discover_metadata(base_url)["token_endpoint"]
+    resource: str = bundle.get("resource") or discover_resource(base_url)
+    fields: dict[str, Any] = {
         "grant_type": "refresh_token",
         "refresh_token": bundle["refresh_token"],
         "client_id": bundle.get("client_id", ""),
@@ -290,12 +305,13 @@ def _refresh(bundle: dict) -> dict:
         # RFC 8707 — required when the bundle was originally issued with
         # one, since the AS verifies the resource matches across refreshes.
         fields["resource"] = resource
-    token = _http_post_form(metadata["token_endpoint"], fields)
+    token = _http_post_form(token_endpoint, fields)
     new_bundle = _bundle_from_token_response(
         token,
         base_url=base_url,
         client_id=bundle.get("client_id", ""),
         resource=resource,
+        token_endpoint=token_endpoint,
         fallback_refresh=bundle["refresh_token"],
         fallback_scope=bundle.get("scope", ""),
     )
@@ -306,7 +322,7 @@ def _refresh(bundle: dict) -> dict:
     return new_bundle
 
 
-def force_refresh() -> dict:
+def force_refresh() -> dict[str, Any]:
     """Force a refresh of the stored bundle and return it.
 
     Raises ``LookupError`` if there's no stored bundle (or no refresh token
@@ -327,22 +343,33 @@ def force_refresh() -> dict:
         return _refresh(bundle)
 
 
-def get_access_token() -> tuple[str, str] | None:
+def get_access_token(*, skip_refresh_if_valid: bool = False) -> tuple[str, str] | None:
     """Return ``(access_token, base_url)`` for the stored bundle, refreshing
     if needed.
 
     Returns ``None`` if no bundle is stored, or if the token has expired and
     cannot be refreshed. Designed to be called from the hook hot path so it
     must never raise.
+
+    If ``skip_refresh_if_valid`` is set, return the stored access token as
+    long as it has any validity left (i.e. ``expires_at > now``), without
+    consulting the AS. Used by the SessionEnd hot path, which has a 30s
+    budget and races a ``/exit``-triggered SIGTERM — a near-expiry refresh
+    can blow that budget and leave the trace unclosed. The next session's
+    SessionStart picks up the refresh.
     """
     bundle = load_bundle()
     if not bundle:
         return None
-    base_url = bundle["base_url"]
+    base_url: str = bundle["base_url"]
 
     now = time.time()
     expires_at = float(bundle.get("expires_at", 0))
     if expires_at > now + REFRESH_BUFFER_SECONDS:
+        token = bundle.get("access_token", "")
+        return (token, base_url) if token else None
+
+    if skip_refresh_if_valid and expires_at > now:
         token = bundle.get("access_token", "")
         return (token, base_url) if token else None
 

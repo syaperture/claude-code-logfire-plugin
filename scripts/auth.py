@@ -241,6 +241,7 @@ def cmd_login(args: argparse.Namespace) -> int:
         base_url=base_url,
         client_id=args.client_id,
         resource=resource,
+        token_endpoint=metadata.get("token_endpoint", ""),
         fallback_scope=scope,
     )
     save_bundle(bundle)

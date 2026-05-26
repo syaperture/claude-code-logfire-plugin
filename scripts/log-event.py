@@ -1273,7 +1273,12 @@ def main() -> None:
         try:
             from oauth_token import get_access_token
 
-            result = get_access_token()
+            # On SessionEnd we're racing a /exit-driven SIGTERM against a 30s
+            # hook budget, and the eager root-span send (added in 0f1b117)
+            # has to ship before any blocking work. Skip the lazy refresh if
+            # the access token still has any life left — the next session's
+            # SessionStart will refresh.
+            result = get_access_token(skip_refresh_if_valid=(_hook_event == "SessionEnd"))
         except (ImportError, OSError, ValueError) as exc:
             log_diag("warn", "OAuth token lookup failed", str(exc))
             result = None
