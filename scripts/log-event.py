@@ -106,7 +106,7 @@ def log_diag(level: str, msg: str, detail: str | None = None) -> None:
     if detail:
         entry["detail"] = detail
     try:
-        with open(_diag_log, "a") as f:
+        with open(_diag_log, "a", encoding="utf-8") as f:
             f.write(json.dumps(entry) + "\n")
     except OSError:
         pass
@@ -365,7 +365,7 @@ def build_cost_details(
 
 def read_state(state_file: str) -> dict | None:
     try:
-        with open(state_file) as f:
+        with open(state_file, encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -374,7 +374,7 @@ def read_state(state_file: str) -> dict | None:
 def write_state(state_file: str, state: dict) -> None:
     fd, tmp = tempfile.mkstemp(prefix=os.path.basename(state_file) + ".", dir=os.path.dirname(state_file))
     try:
-        with os.fdopen(fd, "w") as f:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
             json.dump(state, f)
         os.replace(tmp, state_file)
     except OSError:
@@ -565,7 +565,7 @@ def parse_transcript_slice(
 
     for attempt in range(max_attempts + 1):
         try:
-            with open(transcript_path) as f:
+            with open(transcript_path, encoding="utf-8") as f:
                 all_lines_raw = f.readlines()
         except OSError:
             return [], last_line
@@ -926,7 +926,7 @@ def handle_session_start(
         initial_line = 0
         if transcript_path and os.path.isfile(transcript_path):
             try:
-                with open(transcript_path) as f:
+                with open(transcript_path, encoding="utf-8") as f:
                     initial_line = sum(1 for _ in f)
             except OSError:
                 pass
@@ -945,7 +945,11 @@ def handle_session_start(
             "model": model,
             "term_program": term_program,
             "transcript_path": transcript_path,
-            "last_line": initial_line,
+            # Keyed by transcript_path, not a single scalar: Stop/SubagentStop
+            # events for Task-tool subagents carry their own (separate, much
+            # shorter) transcript file, so a shared offset against the main
+            # session's line count would always look "already consumed".
+            "line_offsets": {transcript_path: initial_line} if transcript_path else {},
             "usage": {
                 "input_tokens": 0,
                 "output_tokens": 0,
@@ -1027,7 +1031,8 @@ def handle_stop(
             return
 
         root_span_id = state["root_span_id"]
-        last_line = state.get("last_line", 0)
+        line_offsets = state.setdefault("line_offsets", {})
+        last_line = line_offsets.get(transcript_path, 0)
         model_default = state.get("model", "")
 
         subagent_type = ""
@@ -1046,7 +1051,7 @@ def handle_stop(
         # Persist state under lock so concurrent hooks can't race; defer the
         # slow OTLP send until after release so a hook timeout can't strand
         # the lock and starve SessionEnd.
-        state["last_line"] = new_total
+        line_offsets[transcript_path] = new_total
         state["all_messages"] = state.get("all_messages", []) + new_messages
         state["cost_details"] = state.get("cost_details", []) + new_cost_details
         for k, v in usage_deltas.items():
@@ -1176,8 +1181,9 @@ def handle_session_end(
         root_span_id = state["root_span_id"]
         model = state.get("model", "")
         state_tp = state.get("transcript_path", "")
-        last_line = state.get("last_line", 0)
+        line_offsets = state.setdefault("line_offsets", {})
         final_tp = transcript_path or state_tp
+        last_line = line_offsets.get(final_tp, 0)
         appended = False
         if final_tp and os.path.isfile(final_tp):
             remaining_calls, new_total = parse_transcript_slice(final_tp, last_line, retries=0)
@@ -1188,7 +1194,7 @@ def handle_session_end(
                 if spans:
                     pending_payloads.append(build_otlp_envelope(spans))
 
-                state["last_line"] = new_total
+                line_offsets[final_tp] = new_total
                 state["all_messages"] = state.get("all_messages", []) + new_msgs
                 state["cost_details"] = state.get("cost_details", []) + new_costs
                 for k, v in usage_deltas.items():
@@ -1254,7 +1260,7 @@ def main() -> None:
     if log_file:
         try:
             entry = {**inp, "captured_at": ts_iso}
-            with open(log_file, "a") as f:
+            with open(log_file, "a", encoding="utf-8") as f:
                 f.write(json.dumps(entry) + "\n")
         except OSError:
             log_diag("error", "Failed to write JSONL log entry")
